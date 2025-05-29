@@ -1,0 +1,179 @@
+name: Pre-commit
+description: This action runs the pre-commit checks.
+inputs:
+  verbose:
+    description: "Print pre-commit hook output or not"
+    required: false
+    default: "false"
+runs:
+  using: "composite"
+  steps:
+    - name: 📦 Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ github.event.pull_request.head.ref }}
+
+    - name: 🔧 Install pre-commit
+      shell: bash
+      run: |-
+        pip install pre-commit
+        pre-commit install
+
+    - name: 🚦 PR Validation
+      id: PR_Validation
+      shell: bash
+      env:
+        VERBOSE: ${{ inputs.verbose }}
+      run: |-
+        set +e # don't exit on error
+
+        verbose_flag=""
+        if [ "${VERBOSE}" == "true" ]; then
+          verbose_flag="-v"
+        fi
+
+        # ensure we have the refs we're comparing
+        git checkout ${GITHUB_BASE_REF}
+        git checkout ${GITHUB_HEAD_REF}
+
+        # capture the output of the pre-commit run
+        pre-commit run 2>&1 ${verbose_flag} --from-ref ${GITHUB_BASE_REF} --to-ref ${GITHUB_HEAD_REF} | tee pre-commit.log
+        exit_code=${PIPESTATUS[0]}
+        result='passed'
+        if [ $exit_code -ne 0 ]; then
+          result='failed'
+        fi
+        echo "result=${result}" >> $GITHUB_OUTPUT
+        echo "exit_code=${exit_code}" >> $GITHUB_OUTPUT
+
+    - name: 👀 Check exit code
+      shell: bash
+      env:
+        EXIT_CODE: ${{ steps.PR_Validation.outputs.exit_code }}
+        RESULT: ${{ steps.PR_Validation.outputs.result }}
+      run: |
+        echo "the exit code is: ${EXIT_CODE}"
+        echo "the result is: ${RESULT}"
+
+    - name: 💬 PR comment
+      uses: actions/github-script@v7
+      env:
+        RESULT: ${{ steps.PR_Validation.outputs.result }}
+      with:
+        script: |
+          const prNumber = context.payload.pull_request.number;
+          // read the pre-commit.log file
+          const fs = require('fs');
+          const preCommitComplete = fs.readFileSync('pre-commit.log', 'utf8');
+
+          // Unique marker to identify the comment
+          const marker = '<!-- precommit-comment -->';
+          // Build the comment body. The marker is included so that we can update this comment later.
+          // if the pre-commit checks fail.
+          const preCommitStatus = process.env.RESULT;
+
+          // define the body content based on the pre-commit status
+          var bodyContent = '';
+          if (preCommitStatus === 'passed') {
+            bodyContent = `${marker}
+            > [!TIP]
+            > ## Pre-commit hooks passed!
+            > No issues found.
+            `;
+          } else {
+            bodyContent = `${marker}
+            > [!CAUTION]
+            > ## Pre-commit hooks failed!
+            > Please fix the issues, and try again!
+            `;
+          }
+
+          const commonBody = `
+            <details><summary>Output</summary>
+            <p>
+
+            \`\`\`${preCommitComplete}\`\`\`
+
+            </p>
+            </details>
+
+            > [!NOTE]
+            > You can run the pre-commit checks locally by following the steps below.
+            > <details><summary>Setup steps</summary>
+            > <p>
+            >
+            > #### First time setup
+            > \`\`\`bash
+            > # install pre-commit
+            > brew install pre-commit
+            >
+            > # install hooks
+            > pre-commit install
+            > \`\`\`
+            >
+            > #### Regular usage
+            > Stage some files and commit.
+            > This will run the hooks configured in [.pre-commit-config.yaml](https://github.com/${context.repo.owner}/${context.repo.repo}/blob/${{ github.base_ref }}/.pre-commit-config.yaml).
+            > \`\`\`bash
+            > git add .
+            > git commit --trailer 'Refs: JIRA-1234' -m "feat: add new feature"
+            > \`\`\`
+            >
+            > #### Debugging hooks
+            > \`\`\`bash
+            > # run checks for the staged files; use -v to view hooks output
+            > pre-commit run
+            >
+            > # run checks for a specific hook
+            > pre-commit run <hook_id> -v
+            >
+            > # run checks for all files in the repository
+            > pre-commit run --all-files -v
+            > \`\`\`
+            >
+            > </p>
+            > </details>
+
+            For more information, see the [Contribution Guide](https://github.com/${context.repo.owner}/${context.repo.repo}/blob/main/CONTRIBUTION.md).
+          `;
+
+          // Append the common body to the comment
+          const bodyComplete = bodyContent + commonBody;
+
+          // List all comments on the PR
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+          });
+
+          // Look for an existing comment with our marker
+          const existingComment = comments.find(comment => comment.body.includes(marker));
+
+          if (existingComment) {
+            // Update the existing comment
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existingComment.id,
+              body: bodyComplete,
+            });
+            console.log(`Updated comment ${existingComment.id}`);
+          } else {
+            // Create a new comment on the PR
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: bodyComplete,
+            });
+            console.log('Created new comment');
+          }
+
+    - name: 👋 Return result
+      shell: bash
+      env:
+        EXIT_CODE: ${{ steps.PR_Validation.outputs.exit_code }}
+      run: |
+        exit ${EXIT_CODE}
